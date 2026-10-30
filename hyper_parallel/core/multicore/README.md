@@ -4,6 +4,9 @@ Multicore 是 HyperParallel 的 Torch 组件，提供芯片内多核 MPMD 执行
 它通过 AIC/AIV 分工和核级单边通信，把通信、矩阵乘与向量计算按 tile 编排，减少 kernel 启动并重叠通信与计算。
 当前业务接口包括 MoE 专家、Router 和四流 shifted mHC；三个组件可分别使用。
 
+[MegaMoe 路由融合与 HBM 存储约束](docs/mega_moe_route_fusion.md) · [实验结果](docs/mega_moe_route_fusion_results.md)
+· [64 组合性能与显存报告](docs/mega_moe_switch_matrix_results_20261102.md)
+
 ## 功能与适用范围
 
 | 接口 | 执行内容 | 设备与精度 |
@@ -12,7 +15,7 @@ Multicore 是 HyperParallel 的 Torch 组件，提供芯片内多核 MPMD 执行
 | `MegaGate` | 线性投影、评分与 TopK | NPU 非空 `sqrtsoftplus` 使用原生 Route；其他支持场景使用 Torch |
 | `MegaMhc` | 四流 shifted mHC 的残差混合、映射预测和输入 RMSNorm | Ascend NPU；BF16 激活/RMSNorm 权重，FP32 映射参数 |
 
-MegaMoe 不包含共享专家或 Router 的辅助 loss；这些仍由模型执行。
+MegaMoe 支持可选的本地共享 SwiGLU 专家及独立前后向融合开关；Router 的辅助 loss 仍由模型执行。
 MegaMhc 用于已有四流 mHC 结构，首层状态初始化、跨层传递和末层合并由模型管理。
 多核调度及通算掩盖原理见[架构设计](docs/architecture.md)。
 
@@ -94,6 +97,35 @@ output = experts(hidden_states, topk_ids=topk_ids, topk_weights=topk_weights)
 - `create_parameters=False` 用于外部参数管理；每次 forward 通过 `expert_weights=(gate_up, down)`
   提供当前已 materialize 的连续本地权重。参数迁移及 checkpoint 说明见 [examples](examples/README.md#checkpoint与参数归属)。
 
+#### 共享专家与路由端点开关
+
+`shared_intermediate_size > 0` 可在同一个模块上启用 token-local shared SwiGLU。模块自有参数时，
+权重为 `shared_gate_up_weight: [2I_s,H]` 和 `shared_down_weight: [H,I_s]`；外部参数管理时，
+在每次 forward 传入同名关键字参数。共享分支参与正常 autograd，并独立加入资源兼容性检查。
+
+```python
+experts = MegaMoeExperts(
+    hidden_size=512, intermediate_size=128, num_experts=48, top_k=8,
+    shared_intermediate_size=128, forward_fusion_mode="permute",
+    backward_fusion_mode="legacy", ep_group=dist.group.WORLD,
+).to(device="npu", dtype=torch.bfloat16)
+output = experts(hidden_states, topk_ids, topk_weights)
+```
+
+`forward_fusion_mode` 与 `backward_fusion_mode` 分别控制前向和反向路由端点，均支持
+`legacy`、`permute`、`unpermute`、`both`；静态 fixed-shape push 形状可显式选择，动态 token
+形状会保持 legacy。环境变量 `HYPER_PARALLEL_MEGA_MOE_FORWARD_SHARED_EXPERT` 与
+`HYPER_PARALLEL_MEGA_MOE_BACKWARD_SHARED_EXPERT` 可分别覆盖 shared SwiGLU 前向与反向融合；需同时配置
+`shared_intermediate_size` 和 shared expert 权重。详细约束、环境变量和验证记录见
+[MegaMoe 路由融合](docs/mega_moe_route_fusion.md)。
+
+固定形状需要前后向全融合时，可传入 `fusion_mode="full"` 和正的
+`shared_intermediate_size`。该预设启用两个方向的 permute、unpermute 和 shared expert，
+前向在 unpermute 内合入共享输出，反向在图内末尾合入共享输入梯度；
+与冲突的独立开关同时传入会报错。评测与适用限制见
+[全融合修复报告](docs/mega_moe_full_fusion_results_20261103.md)。
+冷启动、零接收 rank、共享梯度舍入和整合审查见[后续正确性审查](docs/mega_moe_integration_review_20261104.md)。
+
 ### MegaMhc
 
 ```python
@@ -132,6 +164,11 @@ MegaMoe 从实际 forward 输入自动维护容量，无需 token 上限或动�
 source 容量、调度行数与实际 owner 接收量分别维护：source/返回区按预留容量，
 计算中间张量及待反向激活按实际接收量分配，空 owner 保留一行 ABI 占位。
 pull 的接收区位于普通 HBM，不属于 SHMEM source/返回区。
+
+MegaMoe 路由融合默认关闭；前向/反向 permute 和 unpermute 可通过各自的
+`forward_fusion_mode` / `backward_fusion_mode` 选择。shared expert 前向和反向也分别使用
+`forward_shared_expert` / `backward_shared_expert` 开关，默认关闭。固定形状 910B 性能结果和显存对照见
+[融合评测结果](docs/mega_moe_fusion_results_20261031.md)。
 
 扩容可能集体重启同一 SHMEM root 的 runtime，再恢复受管 workspace；外部专家参数不移动。
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。

@@ -231,10 +231,10 @@ if __name__ == '__main__':
         version='1.2.0.dev0',
         author='The MindSpore Authors',
         url='https://www.mindspore.cn',
-        download_url='https://gitcode.com/mindspore/hyper-parallel/tags',
+        download_url='https://github.com/mindspore-ai/hyper-parallel/tags',
         project_urls={
-            'Sources': 'https://gitcode.com/mindspore/hyper-parallel',
-            'Issue Tracker': 'https://gitcode.com/mindspore/hyper-parallel/issues',
+            'Sources': 'https://github.com/mindspore-ai/hyper-parallel',
+            'Issue Tracker': 'https://github.com/mindspore-ai/hyper-parallel/issues',
         },
         description=get_description(),
         long_description=get_readme_content(),

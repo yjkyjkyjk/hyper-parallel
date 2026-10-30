@@ -99,7 +99,7 @@ Bit-Exact 默认关闭，已验证范围为单节点 Ascend、BF16/eager、Qwen3
 ### 1. 获取源码
 
 ```bash
-git clone --branch rl https://gitcode.com/mindspore/hyper-parallel.git
+git clone --branch rl https://github.com/mindspore-ai/hyper-parallel.git
 cd hyper-parallel
 ```
 
@@ -412,7 +412,7 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 @software{hyper_rl_2026,
   title = {HyperParallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
   year  = {2026},
-  url   = {https://gitcode.com/mindspore/hyper-parallel},
+  url   = {https://github.com/mindspore-ai/hyper-parallel},
   note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```
