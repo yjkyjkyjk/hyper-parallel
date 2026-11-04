@@ -16,11 +16,15 @@
 import itertools
 import unittest
 
-from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank
+from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import (
+    build_config_for_rank,
+)
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import (
     build_forward_graph, build_route_forward_graph,
 )
-from hyper_parallel.core.multicore.scheduler.config import EVENT_INVALID_ID, TaskSplitValue, TaskType
+from hyper_parallel.core.multicore.scheduler.config import (
+    EVENT_INVALID_ID, TaskSplitValue, TaskType,
+)
 
 
 def _assert_worker_progress(configs):
@@ -31,6 +35,10 @@ def _assert_worker_progress(configs):
         if cfg.ready_event:
             events[rank][cfg.ready_event] = 1
         lanes = cfg.num_workers // 2
+        for index, task_id in enumerate(cfg.cube_task_indices[:cfg.task_index_num[0]]):
+            assert cfg.all_tasks[task_id].task_index % lanes == index % lanes, (
+                "changed GMM core assignment"
+            )
         queued = []
         for queue, count in ((cfg.cube_task_indices, cfg.task_index_num[0]),
                              (cfg.vector_task_indices, cfg.task_index_num[1])):
@@ -87,7 +95,8 @@ class TestSharedForwardSchedule(unittest.TestCase):
                 graph.propagate_splits(values)
                 configs = [build_config_for_rank(graph, values, rank, cores) for rank in range(ep)]
                 join = graph.get_op("weighted_unpermute").fill_config.dependent_event
-                self.assertEqual(graph.get_op("shared_up_proj").fill_config.dependency, EVENT_INVALID_ID)
+                self.assertEqual(graph.get_op("shared_up_proj").fill_config.dependency,
+                                 EVENT_INVALID_ID)
                 self.assertEqual(graph.get_op("shared_down_proj").fill_config.trigger, join)
                 for cfg in configs:
                     self.assertEqual(cfg.all_event_num_triggers[join],

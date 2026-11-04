@@ -25,7 +25,7 @@ from hyper_parallel.core.multicore.diagnostics.common.graph import validate_mega
 from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
 from hyper_parallel.core.multicore.modules.mega_moe.shared import shared_backward_buffers
 from hyper_parallel.core.multicore.modules.mega_moe.backward.storage import can_reuse_backward_dispatch
-from hyper_parallel.core.multicore.scheduler.config import TaskType
+from hyper_parallel.core.multicore.scheduler.config import EVENT_INVALID_ID, TaskType
 
 
 class TestSharedExpertSchedule(unittest.TestCase):
@@ -158,13 +158,13 @@ class TestSharedExpertSchedule(unittest.TestCase):
             shared_first = graph.get_op("shared_up_proj" if graph is fg else "shared_act_grad")
             event = shared_first.fill_config.dependency
             if graph is fg:
-                self.assertEqual(event, 0xFFFFFFFF)
+                self.assertEqual(event, EVENT_INVALID_ID)
                 route_event = graph.get_op(endpoint).fill_config.dependent_event
                 producers = [task for task in cfg.all_tasks[:cfg.task_num]
                              if task.trigger_event == route_event]
                 self.assertEqual(cfg.all_event_num_triggers[route_event], len(producers))
                 self.assertTrue(any(task.task_type == TaskType.TASK_GROUPED_MATMUL
-                                    and task.dependent_event != 0xFFFFFFFF
+                                    and task.dependent_event != EVENT_INVALID_ID
                                     for task in producers))
             else:
                 producers = [task for task in cfg.all_tasks[:cfg.task_num] if task.trigger_event == event]

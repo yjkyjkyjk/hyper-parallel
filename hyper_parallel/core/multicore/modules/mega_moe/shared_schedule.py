@@ -215,9 +215,9 @@ def _is_shared_forward_task(task: TaskDescC) -> bool:
 def schedule_shared_forward_overlap(
     cfg: RuntimeConfigC, tsv: TaskSplitValue, dispatch_task_num: int,
 ) -> None:
-    """Overlap shared GMMs with route Dispatch and SwiGLU respectively.
+    """Overlap shared GMMs with route Dispatch and Combine respectively.
 
-    Cube: shared up -> route up -> shared down -> route down.
+    Cube: shared up -> route up -> route down -> shared down.
     Vector: Dispatch -> shared SwiGLU -> route SwiGLU -> Combine -> endpoint.
     Neither queue can wait on a producer behind its consumer in the other
     queue.  This remains true when stages do not fill a whole worker round.
@@ -235,9 +235,8 @@ def schedule_shared_forward_overlap(
     route_vector = [task_id for task_id in vector_ids if task_id not in shared_vector_set]
     if len(shared_cube) % 2 or len(route_cube) % 2:
         raise ValueError("forward Cube queue requires two equal GMM stages per branch")
-    shared_midpoint, route_midpoint = len(shared_cube) // 2, len(route_cube) // 2
-    cube_ids = (shared_cube[:shared_midpoint] + route_cube[:route_midpoint]
-                + shared_cube[shared_midpoint:] + route_cube[route_midpoint:])
+    shared_midpoint = len(shared_cube) // 2
+    cube_ids = shared_cube[:shared_midpoint] + route_cube + shared_cube[shared_midpoint:]
     vector_ids = (route_vector[:dispatch_task_num] + shared_vector
                   + route_vector[dispatch_task_num:])
     cfg.cube_task_indices[:len(cube_ids)] = cube_ids
