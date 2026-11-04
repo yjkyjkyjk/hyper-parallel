@@ -119,6 +119,9 @@ def add_shared_graph(
     if endpoint is not None:
         fuse_shared_output(graph, tsv, backward=backward)
     route_event = tsv.all_event_num - int(inline_residual)
+    # Shared inputs are independent of route results.  Both producer sets
+    # signal route_event before weighted-unpermute consumes their outputs.
+    shared_start_event = EVENT_INVALID_ID if inline_residual else route_event
     route_terminals = [op for op in graph.topological_sort() if not op.successors and op is not endpoint]
     stride = 2016 * cores
     group = TensorSpec("shared_group_list", [1], runtime_slot, dtype_size=8)
@@ -147,9 +150,10 @@ def add_shared_graph(
         up = tensor("shared_up", [tokens, 2 * intermediate], 3)
         act = tensor("shared_activation", [tokens, intermediate], 4)
         out = tensor("shared_output", [tokens, hidden], 5)
-        first = add("shared_up_proj", OpType.GMM, [x, w1], up, 8, route_event, event_base)
+        first = add("shared_up_proj", OpType.GMM, [x, w1], up, 8, shared_start_event, event_base)
         middle = add("shared_swiglu", OpType.SWIGLU, [up], act, 8 + 2 * stride, event_base, event_base + 1)
-        last = add("shared_down_proj", OpType.GMM, [act, w2], out, 8 + stride, event_base + 1, event_base + 2)
+        completion_event = route_event if inline_residual else event_base + 2
+        last = add("shared_down_proj", OpType.GMM, [act, w2], out, 8 + stride, event_base + 1, completion_event)
     else:
         dy = tensor("shared_dy", [tokens, hidden], 0)
         act = tensor("shared_activation", [tokens, intermediate], 1)
@@ -184,10 +188,57 @@ def add_shared_graph(
             tsv.shared_completion_count = 2 * cores + tokens // 128
         return
     graph.add_edge(first, middle).add_edge(middle, last)
+    # Preserve fill order for the routed FillConfigs' event cursors.  Runtime
+    # dependencies and the worker queues independently permit forward overlap.
     for terminal in route_terminals:
         graph.add_edge(terminal, first)
     tsv.shared_completion_event = event_base + 2
     tsv.shared_completion_count = cores
     if endpoint is not None:
         graph.add_edge(last, endpoint)
+        # Combine is filled first, then shared down adds its producer count.
+        if inline_residual:
+            tsv.shared_completion_event = route_event
         endpoint.fill_config.dependent_event = tsv.shared_completion_event
+
+
+def _is_shared_forward_task(task: TaskDescC) -> bool:
+    """Identify a forward shared task by its private pointer-table slot."""
+    if task.task_type not in (TaskType.TASK_GROUPED_MATMUL, TaskType.TASK_SWI_GLU):
+        return False
+    if task.num_inputs == 0:
+        return False
+    first = task.inputs[0]
+    return first.input_position == FORWARD_POINTER_SLOT and first.tensor_type == 2
+
+
+def schedule_shared_forward_overlap(
+    cfg: RuntimeConfigC, tsv: TaskSplitValue, dispatch_task_num: int,
+) -> None:
+    """Overlap shared GMMs with route Dispatch and SwiGLU respectively.
+
+    Cube: shared up -> route up -> shared down -> route down.
+    Vector: Dispatch -> shared SwiGLU -> route SwiGLU -> Combine -> endpoint.
+    Neither queue can wait on a producer behind its consumer in the other
+    queue.  This remains true when stages do not fill a whole worker round.
+    """
+    if not tsv.shared_expert or not tsv.shared_output_fused:
+        return
+    cube_ids = list(cfg.cube_task_indices[:cfg.task_index_num[0]])
+    vector_ids = list(cfg.vector_task_indices[:cfg.task_index_num[1]])
+    shared_cube = [task_id for task_id in cube_ids if _is_shared_forward_task(cfg.all_tasks[task_id])]
+    shared_vector = [task_id for task_id in vector_ids if _is_shared_forward_task(cfg.all_tasks[task_id])]
+    if not shared_cube or not shared_vector:
+        return
+    shared_cube_set, shared_vector_set = set(shared_cube), set(shared_vector)
+    route_cube = [task_id for task_id in cube_ids if task_id not in shared_cube_set]
+    route_vector = [task_id for task_id in vector_ids if task_id not in shared_vector_set]
+    if len(shared_cube) % 2 or len(route_cube) % 2:
+        raise ValueError("forward Cube queue requires two equal GMM stages per branch")
+    shared_midpoint, route_midpoint = len(shared_cube) // 2, len(route_cube) // 2
+    cube_ids = (shared_cube[:shared_midpoint] + route_cube[:route_midpoint]
+                + shared_cube[shared_midpoint:] + route_cube[route_midpoint:])
+    vector_ids = (route_vector[:dispatch_task_num] + shared_vector
+                  + route_vector[dispatch_task_num:])
+    cfg.cube_task_indices[:len(cube_ids)] = cube_ids
+    cfg.vector_task_indices[:len(vector_ids)] = vector_ids

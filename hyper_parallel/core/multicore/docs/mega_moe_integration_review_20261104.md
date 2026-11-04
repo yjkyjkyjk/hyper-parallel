@@ -205,3 +205,40 @@ MegaMoe 前向 arity 为 28/6、反向为 32/8，两个 dtype 的 `opParaSize=25
 4. **默认值继续按收益实测决定。** 全融合提供统一接口并不意味着共享前向一定更快。
    应分别考虑实际训练形状的延迟、Torch allocated/reserved、SHMEM 和物理 HBM；
    完整训练 step、优化器、checkpoint 与其他层重叠的峰值需要模型级验收，不能由本算子固定形状外推。
+
+## 共享前向调度实验：等待 NPU 验证
+
+以上性能表属于保存点 `c77c9242`，**不是本节候选调度的测量结果**。
+已建立备份分支 `backup/shared-forward-before-schedule` 和标签
+`megamoe-shared-forward-before-schedule`；候选保存在独立分支
+`exp/shared-forward-overlap-20261104`，原功能分支保留在保存点。
+
+候选仅调整前向 shared 与 weighted-unpermute 都已融合时的事件和队列：
+
+| worker 队列 | 保存点 | 候选 |
+| --- | --- | --- |
+| Cube | routed Up → routed Down → shared Up → shared Down | shared Up → routed Up → shared Down → routed Down |
+| Vector | Dispatch → routed SwiGLU → Combine → shared SwiGLU → weighted-unpermute | Dispatch → shared SwiGLU → routed SwiGLU → Combine → weighted-unpermute |
+
+shared Up 读取原始输入及共享权重，其启动不需要等待路由结果，因此移除路由完成依赖。
+候选希望利用 Dispatch 期间的 Cube 空闲执行 shared Up，并让 shared Down 与 routed SwiGLU 有机会并行。
+weighted-unpermute 的等待事件改为两分支汇合：正式形状下，它要求收到
+1024 个 Combine 信号和 20 个 shared Down 信号，避免提前读取结果。
+图的拓扑顺序仍用于保持旧 FillConfig 的事件游标和 descriptor 归属；实际执行顺序由生成后的 worker 队列和事件决定。
+
+没有新增中间张量、复制或 native task 类型。正式形状前向仍为 360 AIC / 3361 AIV；
+反向队列和路由缓冲区复用方案不变。共享反向借用路由临时区，不能直接照搬前向提前策略，
+否则可能覆盖路由反向仍在读取的内容。这里只能确认静态张量规模不增加，显存峰值仍需测量。
+
+主机事件模拟已通过 36 组配置：`T=128/384/512/4096`、`EP=1/2/4`、
+`E=4/6/32`、`top-k=2/8`，覆盖 1/20/24 核及两种前向图构建方式。
+检查包括队列任务完整且唯一、跨 rank 信号、部分 worker 轮次、两分支汇合及所有 worker 最终推进到终止。
+本机仅有 Python 3.9 且缺少 Torch，因此该纯 host 回归通过隔离 package 导入、延迟注解兼容加载执行；
+它不替代标准 Python 3.11 环境的完整 UT 或 NPU 数值回归。
+此外，在其余开关路径上生成的 48 份 rank runtime 配置与保存点逐字节一致；
+候选正式形状的 runtime 序列化大小也没有增加。
+
+蓝区 VPN 当前断开，系统重连失败且 SSH 超时，尚未执行候选 NPU 正确性、性能或峰值显存测试。
+恢复后应先运行小形状重复反向、零接收及正式形状数值回归；通过后再按上文固定 benchmark 口径，
+对保存点全融合、候选全融合和 `both/both/sf0/sb1` 做正反顺序对测。
+在取得该证据之前，不宣称性能改善，不将候选合入原功能分支，也不修改推荐默认值。
