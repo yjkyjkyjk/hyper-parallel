@@ -169,6 +169,8 @@ MegaMoe 路由融合默认关闭；前向/反向 permute 和 unpermute 可通过
 `forward_fusion_mode` / `backward_fusion_mode` 选择。shared expert 前向和反向也分别使用
 `forward_shared_expert` / `backward_shared_expert` 开关，默认关闭。固定形状 910B 性能结果和显存对照见
 [融合评测结果](docs/mega_moe_fusion_results_20261031.md)。
+共享专家全融合的后续调度优化、测量口径与显存结果见
+[共享专家调度性能报告](docs/mega_moe_shared_schedule_results_20261104.md)。
 
 扩容可能集体重启同一 SHMEM root 的 runtime，再恢复受管 workspace；外部专家参数不移动。
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 可设置固定字节预算；预算不足或不能安全重启时明确失败。
