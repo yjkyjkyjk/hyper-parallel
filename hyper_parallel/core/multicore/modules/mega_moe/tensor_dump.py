@@ -103,8 +103,16 @@ def _resolve_swiglu(context: L1TensorViewContext) -> L1TensorView:
     )
 
 
+def _validate_fused_dispatch_view(context: L1TensorViewContext) -> None:
+    """Refuse a contiguous view of a gather whose rows belong to different source tokens."""
+    if (context.io == "input" and context.index == 1
+            and int(context.task_desc.extra_value_0) != 0xFFFFFFFF):
+        raise ValueError("Fused dispatch gathers noncontiguous token rows; select its local GMM consumer input")
+
+
 def _resolve_alltoall(context: L1TensorViewContext) -> L1TensorView:
     """Resolve local communication operands while rejecting remote-address reads."""
+    _validate_fused_dispatch_view(context)
     is_pull = int(context.task_desc.task_type) == TaskType.TASK_SHMEM_GET_MEM
     if is_pull and context.io == "input" and context.index == 1:
         raise ValueError("MegaMoe pull sources belong to a remote rank; select the local dispatch output instead")
@@ -156,6 +164,27 @@ def resolve_mega_moe_l1_tensor_view(context: Any) -> L1TensorView:
         raise TypeError(
             f"MegaMoe L1 view context must be L1TensorViewContext, got {type(context).__name__}"
         )
+    if context.operator.name.startswith("shared_"):
+        if context.task_desc.task_type == TaskType.TASK_GROUPED_MATMUL:
+            if context.io == "output":
+                raise ValueError(
+                    f"MegaMoe L1 cannot snapshot collaborative shared GMM output for {context.stage!r}"
+                )
+            return context.default_view
+        if context.task_desc.task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
+            row_start = int(context.task_desc.task_index) * int(context.task_desc.task_split_value)
+            rows = min(
+                int(context.task_desc.task_split_value),
+                max(int(context.tensor_spec.shape[0]) - row_start, 0),
+            )
+            shape = list(context.tensor_spec.shape)
+            shape[0] = rows
+            offset = row_start * int(shape[1]) * int(context.tensor_desc.data_type)
+            return context.make_view(
+                shape, source_offset_bytes=offset if rows else 0,
+                note="shared expert SwiGLU tile captured at its task boundary",
+            )
+        return context.default_view
     task_type = int(context.task_desc.task_type)
     if task_type == TaskType.TASK_GROUPED_MATMUL:
         return _resolve_grouped_matmul(context)

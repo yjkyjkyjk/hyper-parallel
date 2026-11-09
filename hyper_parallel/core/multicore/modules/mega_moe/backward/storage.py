@@ -26,6 +26,13 @@ _SWIGLU_GRAD = 10
 _INPUT_GRAD = 12
 
 
+def _is_shared_swiglu(task: TaskDescC) -> bool:
+    """Recognize only the independent shared pointer-table contract."""
+    descriptors = (task.inputs[0], task.inputs[1], task.outputs[0])
+    return (all(desc.tensor_type == 2 and desc.input_position == 36 for desc in descriptors)
+            and tuple(desc.dynamic_dim for desc in descriptors) == (4, 5, 6))
+
+
 def _worker_read_order(
     tasks: list[TaskDescC], num_experts: int, num_cores: int,
 ) -> bool:
@@ -67,6 +74,15 @@ def _expert_events_join_readers(
     for task in vector_tasks:
         if task.task_type != TaskType.TASK_SWI_GLU_GRAD:
             continue
+        # Indirect shared operands do not read or overwrite routed receive rows.
+        if task.num_inputs != 2 or task.num_outputs != 1:
+            return False
+        descriptors = (task.inputs[0], task.inputs[1], task.outputs[0])
+        if _is_shared_swiglu(task):
+            continue
+        if (any(desc.tensor_type == 2 for desc in descriptors)
+                or tuple(desc.input_position for desc in descriptors) != (8, 9, 10)):
+            return False
         if task.task_split_num < num_experts or task.task_split_num % num_experts:
             return False
         expert = task.task_index // (task.task_split_num // num_experts)

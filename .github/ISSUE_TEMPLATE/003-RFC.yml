@@ -70,5 +70,5 @@ body:
   attributes:
     label: Before submitting a new issue...
     options:
-      - label: "Make sure you already searched for previous [RFCs](https://gitcode.com/mindspore/hyper-parallel/issues?q=is%3Aall+label%3ARFC+sort%3Arecently-updated)."
+      - label: "Make sure you already searched for previous [RFCs](https://github.com/mindspore-ai/hyper-parallel/issues?q=is%3Aall+label%3ARFC+sort%3Arecently-updated)."
         required: true

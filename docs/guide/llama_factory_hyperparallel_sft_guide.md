@@ -17,7 +17,7 @@
 | **框架**      | **版本**    | **代码**                                            |
 |--------------|-------------|---------------------------------------------------|
 | LlamaFactory | master      | <https://github.com/hiyouga/LlamaFactory>         |
-| HyperParallel | master      | <https://gitcode.com/mindspore/hyper-parallel.git> |
+| HyperParallel | master      | <https://github.com/mindspore-ai/hyper-parallel.git> |
 | Transformers | 4.57.1      |                                                   |
 | Accelerate   | 1.11.0      |                                                   |
 | torch        | 2.7.1       |                                                   |

@@ -13,7 +13,7 @@
 ## 克隆仓库
 
 ```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
+git clone https://github.com/mindspore-ai/hyper-parallel.git
 cd hyper-parallel
 ```
 
@@ -22,9 +22,9 @@ cd hyper-parallel
 采用 origin（fork）+ upstream（主仓库）模式：
 
 ```bash
-# 在 GitCode 上 fork 仓库后
-git remote add origin https://gitcode.com/<your-username>/hyper-parallel.git
-git remote add upstream https://gitcode.com/mindspore/hyper-parallel.git
+# 在 GitHub 上 fork 仓库后
+git remote add origin https://github.com/<your-username>/hyper-parallel.git
+git remote add upstream https://github.com/mindspore-ai/hyper-parallel.git
 ```
 
 ## 构建开发版本
@@ -83,7 +83,7 @@ pip install pytest pylint markdownlint
 
 | Skill | 用途 |
 |-------|------|
-| `autogit` | GitCode fork 工作流自动化（commit、PR、status、squash） |
+| `autogit` | GitCode fork 工作流自动化；GitHub fork 使用原生 `git` 提交和推送 |
 | `code-review` | 分布式正确性、stream sync、内存安全审查 |
 | `dist-op-dev` | 分布式算子开发流程 |
 | `platform-dev` | 平台抽象层开发 |

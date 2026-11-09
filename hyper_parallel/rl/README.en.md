@@ -96,7 +96,7 @@ Use **repository source code with the pinned runtime image**. The current runtim
 ### 1. Get the source
 
 ```bash
-git clone --branch rl https://gitcode.com/mindspore/hyper-parallel.git
+git clone --branch rl https://github.com/mindspore-ai/hyper-parallel.git
 cd hyper-parallel
 ```
 
@@ -331,7 +331,7 @@ If you use HyperParallel-RL, you can cite the software below and record the comm
 @software{hyper_rl_2026,
   title = {HyperParallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
   year  = {2026},
-  url   = {https://gitcode.com/mindspore/hyper-parallel},
+  url   = {https://github.com/mindspore-ai/hyper-parallel},
   note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```

@@ -99,7 +99,7 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 ### 1. 获取源码
 
 ```bash
-git clone --branch rl https://gitcode.com/mindspore/hyper-parallel.git
+git clone --branch rl https://github.com/mindspore-ai/hyper-parallel.git
 cd hyper-parallel
 ```
 
@@ -405,7 +405,7 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 @software{hyper_rl_2026,
   title = {HyperParallel-RL: A Lightweight, Extensible Reinforcement Learning Framework},
   year  = {2026},
-  url   = {https://gitcode.com/mindspore/hyper-parallel},
+  url   = {https://github.com/mindspore-ai/hyper-parallel},
   note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```

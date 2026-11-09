@@ -9,7 +9,7 @@ body:
     attributes:
       label: Checklist
       options:
-        - label: 1. I have searched the existing issues (https://gitcode.com/mindspore/hyper-parallel/issues)
+        - label: 1. I have searched the existing issues (https://github.com/mindspore-ai/hyper-parallel/issues)
         - label: 2. I have read the relevant documentation.
         - label: 3. I have created a minimal reproduction case that clearly demonstrates the issue, including a complete code example and the error message with full traceback and error logs.
     validations:

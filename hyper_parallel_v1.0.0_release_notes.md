@@ -426,6 +426,6 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 
 ## 反馈与贡献
 
-- Issue 反馈：https://gitcode.com/mindspore/hyper-parallel/issues
+- Issue 反馈：https://github.com/mindspore-ai/hyper-parallel/issues
 - 代码贡献：欢迎加入 [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System)
 - 许可证：Apache 2.0
