@@ -3,8 +3,7 @@
 `MegaMoeExperts` 可以把路由端点放入 MegaKernel 的 Dispatch 或终止 epilogue，
 前向和反向分别选择。常规输入仍是原始 `[T, H]` hidden states、`[T, K]` Top-K IDs 和 Router weights。
 
-本机 DSV 组件、裁剪 DSV 与 8 层纯 MoE 的性能、显存及数值验收结果见
-[路由融合实验报告](mega_moe_route_fusion_results.md)。
+本文件描述融合接口、HBM 存储约束与生命周期。固定形状性能和 DFX 结果作为本机报告与 trace 保存，不随代码提交。
 
 ## HBM 存储约束
 
@@ -41,8 +40,7 @@ Router weight 梯度在所有本地 Dispatch 读完权重后计算，使用独�
 共享反向的临时梯度复用已完成的路由临时区；若权重梯度也复用该临时区，返回前仍复制为紧凑存储，
 避免保活较大的底层缓冲区。返回的总 dX 使用独立存储。
 前向专家输出快照仍供 Router 梯度使用；全融合反向不覆盖该快照，支持保留计算图后重复反向。
-固定形状实测结果见[全融合修复报告](mega_moe_full_fusion_results_20261103.md)，
-冷启动、零接收 rank 与共享梯度精度的后续修复见[正确性审查](mega_moe_integration_review_20261104.md)。
+固定形状性能结果以本机最新测试为准；冷启动、零接收 rank、共享梯度舍入和重复反向由当前 NPU 回归测试验证。
 
 独立开关继续有效：仅当对应方向的 unpermute 和共享计算数据同时可用时，才合并该方向的相加。
 关闭共享反向时仍使用外部 autograd；此组合不属于完整反向融合。

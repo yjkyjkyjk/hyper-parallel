@@ -1,9 +1,0 @@
-case,forward_route,backward_route,forward_shared,backward_shared,reference,median_ms,reference_peak_device_used_sampled_bytes,peak_device_used_sampled_bytes,shmem_heap_bytes,peak_allocated_bytes,peak_reserved_bytes,samples,warmup
-route_legacy,legacy,legacy,false,false,common,34.5284,5225971712,5391671296,840957952,2562956800,2998927360,30,8
-route_forward_permute,permute,legacy,false,false,common,34.7600,5223944192,5431316480,840957952,2562826752,3038773248,30,8
-route_forward_unpermute,unpermute,legacy,false,false,common,34.5646,5225406464,5447385088,840957952,2562597888,3055550464,30,8
-route_backward_permute,legacy,permute,false,false,common,34.5150,5225570304,5407551488,840957952,2986910208,3365928960,30,8
-route_backward_unpermute,legacy,unpermute,false,false,common,34.4791,5225549824,5452926976,840957952,2986910208,3365928960,30,8
-shared_forward,permute,legacy,true,false,external_shared,36.0710,4795793408,4764770304,840957952,2510034944,2992635904,30,8
-shared_backward,permute,legacy,false,true,external_shared,34.1498,4796035072,5137088512,840957952,2986910208,3365928960,30,8
-shared_both,permute,legacy,true,true,external_shared,35.0623,4795031552,5139877888,840957952,2988643840,3368026112,30,8

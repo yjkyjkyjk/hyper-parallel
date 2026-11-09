@@ -49,6 +49,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import
     get_swiglu_tiling_bytes,
     get_up_proj_tiling_bytes,
 )
+from hyper_parallel.core.multicore.modules.mega_moe.shared_schedule import (
+    schedule_shared_forward_overlap,
+)
 from hyper_parallel.core.multicore.scheduler.builder import allocate_graph_config
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC,
@@ -150,6 +153,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
         swiglu_op.task_num,
         combine_op.task_num,
     )
+    schedule_shared_forward_overlap(cfg, tsv, dispatch_op.task_num)
     add_dynamic_data(cfg, tsv, dynamic_input_position=6)
 
     cfg.task_num = task_num_all
