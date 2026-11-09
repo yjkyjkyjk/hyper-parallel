@@ -26,24 +26,42 @@ from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from hyper_parallel.core.multicore import _collective, shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
+from .fusion import execute_mega_moe as execute_route_fused
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
-    _COMMUNICATION_SPLIT,
-    _resolve_capacity_factors,
-    bind_mega_moe_spec,
+    _COMMUNICATION_SPLIT, _align_capacity, _resolve_capacity_factors,
+    _resolve_fusion_modes, _resolve_shared_fusion_modes, bind_mega_moe_spec,
 )
 from .workspace import MegaMoeWorkspace
 
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+
+
+def _apply_fusion_preset(specification: dict[str, Any], mode: str | None) -> None:
+    """Normalize the explicit full preset before resource compatibility checks."""
+    if mode is None:
+        return
+    if mode != "full":
+        raise ValueError("fusion_mode must be None or 'full'")
+    if not specification["shared_intermediate_size"]:
+        raise ValueError("fusion_mode='full' requires a positive shared_intermediate_size")
+    settings = {"forward_fusion_mode": "both", "backward_fusion_mode": "both",
+                "forward_shared_expert": True, "backward_shared_expert": True}
+    for name, value in settings.items():
+        actual = specification[name]
+        if actual is not None and (type(actual) is not type(value) or actual != value):
+            raise ValueError("fusion_mode='full' conflicts with individual fusion switches")
+    specification.update(settings)
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -74,6 +92,28 @@ def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
         )
 
 
+def _resolve_token_capacity(
+    local_num_tokens: int | None,
+    max_local_num_tokens: int | None,
+    hidden_size: int,
+    top_k: int,
+) -> int:
+    """Validate the token mode and reserve aligned rows within the native route ABI."""
+    if local_num_tokens is None and max_local_num_tokens is None:
+        return _COMMUNICATION_SPLIT
+    if local_num_tokens is not None and max_local_num_tokens is not None:
+        raise ValueError("Provide only one of local_num_tokens and max_local_num_tokens")
+    if max_local_num_tokens is None:
+        return local_num_tokens
+    if (not isinstance(max_local_num_tokens, int) or isinstance(max_local_num_tokens, bool)
+            or max_local_num_tokens <= 0):
+        raise ValueError("max_local_num_tokens must be a positive integer")
+    reserved_tokens = _align_capacity(max_local_num_tokens)
+    if reserved_tokens * max(hidden_size, top_k) > 2**31 - 1:
+        raise ValueError("max_local_num_tokens exceeds native INT32 route limits")
+    return reserved_tokens
+
+
 def _create_mega_moe_parameters(
     local_experts: int,
     hidden_size: int,
@@ -96,6 +136,22 @@ def _create_mega_moe_parameters(
     for expert_index in range(local_experts):
         torch.nn.init.xavier_uniform_(gate_up_weight[expert_index])
         torch.nn.init.xavier_uniform_(down_weight[expert_index])
+    return gate_up_weight, down_weight
+
+
+def _create_shared_expert_parameters(
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[torch.nn.Parameter, torch.nn.Parameter]:
+    """Create packed shared SwiGLU parameters in dense linear layout."""
+    gate_up_weight = torch.nn.Parameter(
+        torch.empty((intermediate_size * 2, hidden_size))
+    )
+    down_weight = torch.nn.Parameter(
+        torch.empty((hidden_size, intermediate_size))
+    )
+    torch.nn.init.xavier_uniform_(gate_up_weight)
+    torch.nn.init.xavier_uniform_(down_weight)
     return gate_up_weight, down_weight
 
 
@@ -181,6 +237,9 @@ class _MegaMoeExecutionResources:
             self.spec.expert_weight_layout,
             self.spec.initial_capacity_factor, self.spec.capacity_growth_factor,
             self.spec.dispatch_split, self.spec.combine_split, self.spec.max_local_num_tokens, self.spec.auto_tokens,
+            self.spec.forward_fusion_mode, self.spec.backward_fusion_mode,
+            self.spec.shared_intermediate_size,
+            self.spec.forward_shared_expert, self.spec.backward_shared_expert,
         )
 
     def prepare_auto_workspace(self, tokens: int, received: int, tensor: torch.Tensor) -> None:
@@ -207,7 +266,9 @@ class _MegaMoeExecutionResources:
             return
         fields = ("local_num_tokens", "max_local_num_tokens", "hidden_size", "intermediate_size",
                   "num_experts", "top_k", "initial_capacity_factor", "capacity_growth_factor", "dispatch_mode",
-                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens")
+                  "dispatch_split", "combine_split", "swiglu_limit", "expert_weight_layout", "ep_size", "auto_tokens",
+                  "forward_fusion_mode", "backward_fusion_mode", "shared_intermediate_size",
+                  "forward_shared_expert", "backward_shared_expert")
         # BF16 is the sole supported dtype; the literal tags also identify the protocol.
         manifest = ("dynamic_tokens_v3", "bfloat16",
                     tuple(tuple(spec.get(key) for key in fields) for spec in specifications))
@@ -327,6 +388,14 @@ class MegaMoeExperts(MulticoreModule):
         num_experts: int,
         top_k: int,
         swiglu_limit: float | None = None,
+        local_num_tokens: int | None = None,
+        max_local_num_tokens: int | None = None,
+        fusion_mode: Literal["full"] | None = None,
+        forward_fusion_mode: str | None = None,
+        backward_fusion_mode: str | None = None,
+        shared_intermediate_size: int = 0,
+        forward_shared_expert: bool | None = None,
+        backward_shared_expert: bool | None = None,
         ep_size: int | None = None,
         ep_group: Any | None = None,
         create_parameters: bool = True,
@@ -359,33 +428,47 @@ class MegaMoeExperts(MulticoreModule):
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
                 preserves the legacy unclamped path.
+            local_num_tokens: Optional exact static input rows; omit for automatic token capacity.
+            max_local_num_tokens: Optional upper bound for variable input rows; mutually exclusive with static rows.
+            fusion_mode: ``"full"`` enables all endpoints and shared projections, including
+                output/dX addition; requires a positive shared width and compatible switches.
+                ``None`` preserves independent settings.
+            forward_fusion_mode: Forward endpoint selection: legacy, permute, unpermute or both.
+            backward_fusion_mode: Independent backward endpoint selection; defaults to legacy.
+                Explicit fusion supports static push and pull; it rejects dynamic tokens,
+                top_k > 16 and T * K > 2**24. Pull defaults to legacy in both directions.
+            shared_intermediate_size: Local shared SwiGLU width; zero disables the branch.
+                External parameter management requires paired shared weights at forward time.
+            forward_shared_expert: Fuse shared forward projections into MegaMoe.
+            backward_shared_expert: Fuse shared backward projections into MegaMoe.
             ep_size: Optional compatibility check; normally inferred from explicit ep_group.
             create_parameters: Allocate owned weights; False requires explicit expert_weights each forward.
             expert_weight_layout: Logical expert-weight axis order. ``"EIO"`` means
                 ``[experts, in_features, out_features]`` and preserves the historical layout. ``"EOI"`` means
                 ``[experts, out_features, in_features]`` and accepts Torch linear storage directly. ``EOI`` weights
                 must use dense contiguous storage for zero-copy execution.
-            ep_group: Explicit EP group; expert ownership follows group-local rank order.
-                Disjoint PP/DP groups bootstrap independently. Only one ordered EP membership
-                can be active in SHMEM per process.
+            ep_group: Explicit EP group; ownership follows group-local rank order. Disjoint
+                PP/DP groups bootstrap independently; SHMEM permits one active ordered membership.
         """
+        reserved_tokens = _resolve_token_capacity(local_num_tokens, max_local_num_tokens, hidden_size, top_k)
         specification = {
-            "local_num_tokens": _COMMUNICATION_SPLIT,
-            "hidden_size": hidden_size,
-            "intermediate_size": intermediate_size,
-            "num_experts": num_experts,
-            "top_k": top_k,
-            "initial_capacity_factor": initial_capacity_factor,
-            "swiglu_limit": swiglu_limit,
-            "ep_size": _resolve_ep_size(ep_size, ep_group),
-            "ep_group": ep_group,
+            "local_num_tokens": reserved_tokens,
+            "hidden_size": hidden_size, "intermediate_size": intermediate_size,
+            "num_experts": num_experts, "top_k": top_k,
+            "initial_capacity_factor": initial_capacity_factor, "swiglu_limit": swiglu_limit,
+            "ep_size": _resolve_ep_size(ep_size, ep_group), "ep_group": ep_group,
             "expert_weight_layout": expert_weight_layout,
-            "dispatch_mode": dispatch_mode,
-            "capacity_growth_factor": capacity_growth_factor,
-            "dispatch_split": dispatch_split,
-            "combine_split": combine_split,
+            "dispatch_mode": dispatch_mode, "capacity_growth_factor": capacity_growth_factor,
+            "forward_fusion_mode": forward_fusion_mode, "backward_fusion_mode": backward_fusion_mode,
+            "shared_intermediate_size": shared_intermediate_size,
+            "forward_shared_expert": forward_shared_expert,
+            "backward_shared_expert": backward_shared_expert,
+            "dispatch_split": dispatch_split, "combine_split": combine_split,
         }
-        specification["auto_tokens"] = True
+        _apply_fusion_preset(specification, fusion_mode)
+        specification["auto_tokens"] = local_num_tokens is None and max_local_num_tokens is None
+        if max_local_num_tokens is not None:
+            specification["max_local_num_tokens"] = max_local_num_tokens
         specification = self._resolve_specification(specification)
         compatibility_key = tuple(
             id(value) if name == "ep_group" else value for name, value in specification.items())
@@ -394,6 +477,8 @@ class MegaMoeExperts(MulticoreModule):
             resource_compatibility_key=compatibility_key,
             resource_scope_key=("mega_moe", shmem.root_members(ep_group) if dist.is_initialized() else id(ep_group)),
         )
+        self.local_num_tokens = local_num_tokens
+        self.max_local_num_tokens = max_local_num_tokens
         self._initialize_module_state(specification, create_parameters=create_parameters)
 
     def _initialize_module_state(
@@ -411,6 +496,8 @@ class MegaMoeExperts(MulticoreModule):
         self.dispatch_split = specification["dispatch_split"]
         self.combine_split = specification["combine_split"]
         self.swiglu_limit = specification["swiglu_limit"]
+        self.shared_intermediate_size = specification["shared_intermediate_size"]
+        self.forward_shared_expert, self.backward_shared_expert = _resolve_shared_fusion_modes(specification)
         self.ep_size = specification["ep_size"]
         self.local_experts = self.num_experts // self.ep_size
         self._ep_group = specification["ep_group"]
@@ -421,6 +508,13 @@ class MegaMoeExperts(MulticoreModule):
         else:
             self.register_parameter("gate_up_weight", None)
             self.register_parameter("down_weight", None)
+        if create_parameters and self.shared_intermediate_size:
+            self.shared_gate_up_weight, self.shared_down_weight = _create_shared_expert_parameters(
+                self.hidden_size, self.shared_intermediate_size,
+            )
+        else:
+            self.register_parameter("shared_gate_up_weight", None)
+            self.register_parameter("shared_down_weight", None)
 
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
@@ -448,12 +542,15 @@ class MegaMoeExperts(MulticoreModule):
             dispatch_split=specification["dispatch_split"],
             combine_split=specification["combine_split"],
             auto_tokens=specification.get("auto_tokens", False),
+            shared_intermediate_size=specification.get("shared_intermediate_size", 0),
         )
         swiglu_limit = specification["swiglu_limit"]
+        forward_mode, backward_mode = _resolve_fusion_modes(specification)
         return {
             **specification,
             "initial_capacity_factor": initial_capacity_factor,
             "capacity_growth_factor": capacity_growth_factor,
+            "forward_fusion_mode": forward_mode, "backward_fusion_mode": backward_mode,
             "swiglu_limit": float(swiglu_limit) if swiglu_limit is not None else None,
         }
 
@@ -470,6 +567,7 @@ class MegaMoeExperts(MulticoreModule):
         dispatch_split: int,
         combine_split: int,
         auto_tokens: bool = False,
+        shared_intermediate_size: int = 0,
     ) -> None:
         """Validate static shape and topology values before allocation."""
         values = {
@@ -483,6 +581,10 @@ class MegaMoeExperts(MulticoreModule):
         for name, value in values.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+        if (not isinstance(shared_intermediate_size, int)
+                or isinstance(shared_intermediate_size, bool)
+                or shared_intermediate_size < 0):
+            raise ValueError("shared_intermediate_size must be a nonnegative integer")
         if top_k > num_experts:
             raise ValueError(
                 f"top_k ({top_k}) cannot exceed num_experts ({num_experts})."
@@ -554,6 +656,8 @@ class MegaMoeExperts(MulticoreModule):
                 f"hidden size {self.hidden_size}, got {tuple(hidden_states.shape)}."
             )
         hidden_flat = hidden_states.reshape(-1, self.hidden_size)
+        if self.local_num_tokens is not None and hidden_flat.shape[0] != self.local_num_tokens:
+            raise ValueError(f"hidden_states must contain {self.local_num_tokens} local tokens")
         route_shape = (hidden_flat.shape[0], self.top_k)
         if tuple(topk_ids.shape) != route_shape:
             raise ValueError(
@@ -574,6 +678,93 @@ class MegaMoeExperts(MulticoreModule):
         self._validate_tensors(hidden_flat, expert_weights)
         return hidden_flat
 
+    def _resolve_shared_weights(
+        self,
+        hidden_states: torch.Tensor,
+        shared_gate_up_weight: torch.Tensor | None,
+        shared_down_weight: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Resolve and validate the optional token-local shared SwiGLU weights."""
+        if not self.shared_intermediate_size:
+            if shared_gate_up_weight is not None or shared_down_weight is not None:
+                raise ValueError("Shared weights require shared_intermediate_size at construction")
+            return None, None
+        if shared_gate_up_weight is None and shared_down_weight is None:
+            shared_gate_up_weight = self.shared_gate_up_weight
+            shared_down_weight = self.shared_down_weight
+        if shared_gate_up_weight is None or shared_down_weight is None:
+            raise ValueError("Both shared_gate_up_weight and shared_down_weight are required")
+        expected_shapes = (
+            (self.shared_intermediate_size * 2, self.hidden_size),
+            (self.hidden_size, self.shared_intermediate_size),
+        )
+        for name, weight, expected in zip(
+            ("shared_gate_up_weight", "shared_down_weight"),
+            (shared_gate_up_weight, shared_down_weight),
+            expected_shapes,
+        ):
+            if tuple(weight.shape) != expected:
+                raise ValueError(f"{name} must have shape {expected}, got {tuple(weight.shape)}")
+            if (weight.device != hidden_states.device or weight.dtype != hidden_states.dtype
+                    or not weight.is_contiguous()):
+                raise ValueError(
+                    "Shared weights must be contiguous and match the input device and dtype"
+                )
+        return shared_gate_up_weight, shared_down_weight
+
+    @staticmethod
+    def _execute_shared_expert(
+        hidden_states: torch.Tensor,
+        shared_gate_up_weight: torch.Tensor,
+        shared_down_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate the token-local shared SwiGLU branch with autograd support."""
+        gate_up = F.linear(hidden_states, shared_gate_up_weight)
+        gate, up = gate_up.chunk(2, dim=-1)
+        return F.linear(F.silu(gate) * up, shared_down_weight)
+
+    def _validate_graph_capture(self) -> None:
+        """Reject capture when allocation growth or dynamic scheduling can synchronize."""
+        if (self.dispatch_mode == "push" or self.max_local_num_tokens is not None) and (
+                torch.npu.is_current_stream_capturing()):
+            raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
+
+    def _execute_routed_experts(
+        self, hidden_flat: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor], shared_weights: tuple[Any, Any],
+        route: Any, plan: Any, workspace: MegaMoeWorkspace,
+    ) -> torch.Tensor:
+        """Execute the selected expert graph within the caller's workspace lease."""
+        pull = self.dispatch_mode == "pull"
+        fused = (plan.spec.forward_fusion_mode != "legacy" or plan.spec.backward_fusion_mode != "legacy"
+                 or plan.spec.forward_shared_expert or plan.spec.backward_shared_expert)
+        if fused:
+            routed_output = execute_route_fused(
+                hidden_flat, topk_ids, topk_weights, weights[0], weights[1],
+                shared_weights[0], shared_weights[1], route, plan, workspace,
+            )
+        else:
+            expert_output = execute_mega_moe_with_permutation(
+                hidden_flat,
+                topk_ids,
+                weights[0],
+                weights[1],
+                route,
+                plan,
+                workspace,
+                topk_weights=topk_weights if pull else None,
+                workspace_claimed=pull,
+            )
+            if pull:
+                routed_output = expert_output
+            else:
+                routed_output = restore_topk_output(
+                    expert_output,
+                    route.unpermute_mapping,
+                    topk_weights,
+                )
+        return routed_output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -582,6 +773,8 @@ class MegaMoeExperts(MulticoreModule):
         *,
         tokens_per_expert: torch.Tensor | None = None,
         expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        shared_gate_up_weight: torch.Tensor | None = None,
+        shared_down_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -592,27 +785,25 @@ class MegaMoeExperts(MulticoreModule):
             expert_weights: Current unsharded weights owned by an outer module.
                 Noncontiguous EIO weights are copied with autograd tracking, never cached
                 by this executor. EOI weights must be contiguous for zero-copy execution.
+            shared_gate_up_weight: Packed shared gate/up weight with shape
+                ``[2 * shared_intermediate_size, hidden_size]``.
+            shared_down_weight: Shared down weight with shape
+                ``[hidden_size, shared_intermediate_size]``.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
 
         Returns:
             Tensor matching the shape and dtype of ``hidden_states``.
-
-        Raises:
-            ValueError: EOI expert weights are noncontiguous.
-
         Note:
-            ``tokens_per_expert`` must describe the current ``topk_ids`` exactly.
-            The steady-state path validates metadata but deliberately does not
-            rebuild and compare the histogram.
+            Counts must describe current IDs exactly; steady-state metadata validation
+            does not recompute the histogram. Noncontiguous EOI weights raise ValueError.
         """
         weights = ((self.gate_up_weight, self.down_weight) if expert_weights is None else expert_weights)
         hidden_flat = self._validate_forward_inputs(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            weights,
+            hidden_states, topk_ids, topk_weights, tokens_per_expert, weights,
+        )
+        shared_weights = self._resolve_shared_weights(
+            hidden_flat, shared_gate_up_weight, shared_down_weight,
         )
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("MegaMoe push heap growth and dynamic tokens do not support graph capture")
@@ -621,17 +812,16 @@ class MegaMoeExperts(MulticoreModule):
             int(torch.is_grad_enabled()) | (int(hidden_flat.requires_grad) << 1)
             | (int(weights[0].requires_grad) << 2) | (int(weights[1].requires_grad) << 3)
             | (int(topk_weights.requires_grad) << 4)
+            | (int(shared_weights[0] is not None and shared_weights[0].requires_grad) << 5)
+            | (int(shared_weights[1] is not None and shared_weights[1].requires_grad) << 6)
         )}
+        if resources.spec.forward_permute_fused:
+            route_options["route_slots"] = resources.plan.route_slots
         pull = self.dispatch_mode == "pull"
         automatic = resources.spec.auto_tokens
         claimed = False
         def prepare_workspace(tokens: int, received: int) -> None:
-            """Grow before publishing pull source rows into symmetric memory.
-
-            Args:
-                tokens: Current local source-token count.
-                received: Current routed receive-row count.
-            """
+            """Reserve source and receive rows before publishing pull inputs."""
             nonlocal claimed
             resources.prepare_auto_workspace(tokens, received, hidden_flat)
             claimed = pull
@@ -642,6 +832,7 @@ class MegaMoeExperts(MulticoreModule):
             resources.workspace.ensure(resources.spec, hidden_flat.dtype, hidden_flat.device)
             resources.workspace.claim()
             claimed = True
+        routed_output = None
         try:
             # Pull source writes and execution must share one workspace lease.
             with torch.no_grad():
@@ -656,29 +847,24 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
-            expert_output = execute_mega_moe_with_permutation(
-                hidden_flat,
-                topk_ids,
-                weights[0],
-                weights[1],
-                route,
-                plan,
-                resources.workspace,
-                topk_weights=topk_weights if pull else None,
-                workspace_claimed=pull,
+            plan = resources.plan_for_tokens(
+                route.metadata.plan_tokens if resources.spec.dynamic_tokens else resources.spec.local_num_tokens,
+                hidden_flat.device,
+            )
+            routed_output = self._execute_routed_experts(
+                hidden_flat, topk_ids, topk_weights, weights, shared_weights,
+                route, plan, resources.workspace,
             )
         finally:
             if claimed:
                 resources.workspace.release()
-        if pull:
-            return expert_output.reshape_as(hidden_states)
-        output = restore_topk_output(
-            expert_output,
-            route.unpermute_mapping,
-            topk_weights,
-        )
-        return output.reshape(hidden_states.shape)
+        output = routed_output.reshape_as(hidden_states)
+        if shared_weights[0] is not None and not (
+                plan.spec.forward_shared_expert or plan.spec.backward_shared_expert):
+            output = output + self._execute_shared_expert(
+                hidden_flat, shared_weights[0], shared_weights[1],
+            ).reshape_as(hidden_states)
+        return output
 
     def _create_execution_resources(
         self,

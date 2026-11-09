@@ -44,7 +44,7 @@ EVENT_INVALID_ID         = 0xFFFFFFFF
 RUNTIME_PROTOCOL_VERSION = 1
 
 
-def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
+def mega_moe_event_capacity(num_experts: int, ep_size: int, *, shared_expert: bool = False) -> int:
     """Reserve graph events and the complete atomic write at the last trigger.
 
     Args:
@@ -58,7 +58,8 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
         raise ValueError("num_experts must be positive and divisible by ep_size")
     # Ready and worker completion follow termination with separate atomic lanes.
     final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
-    required = final_event + ATOMIC_ADD_VALUE_LEN
+    # Shared local tasks use three forward and five backward completion lanes.
+    required = final_event + ATOMIC_ADD_VALUE_LEN + (32 if shared_expert else 0)
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
 
@@ -118,6 +119,9 @@ class TaskType(IntEnum):
     TASK_GATE_GRAD_ADD_SELECTED           = 139
     TASK_GATE_GRAD_ZEROS                  = 140
     TASK_SHMEM_GET_MEM              = 141
+    TASK_UNPERMUTE_REDUCE_GRAD = 142
+    TASK_TOPK_WEIGHT_GRAD = 143
+    TASK_WEIGHTED_UNPERMUTE = 144
 
 
 class EventType(IntEnum):
@@ -228,7 +232,9 @@ class RuntimeConfigC(ctypes.Structure):
         ("aiv_profile_record_capacity", ctypes.c_uint32),
         ("completion_event", ctypes.c_uint32),
         ("protocol_version", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 6),
+        ("shared_tensor_table", ctypes.c_uint64),
+        ("shared_tiling", ctypes.c_uint64),
+        ("_padding", ctypes.c_uint32 * 2),
     ]
 
 
@@ -285,6 +291,11 @@ class TaskSplitValue:
     all_expert_num: int = 32
     top_k:          int = 8
     dispatch_mode: str = "push"
+    extra_event_num: int = 0
+    shared_expert: bool = False
+    shared_completion_event: int = EVENT_INVALID_ID
+    shared_completion_count: int = 0
+    shared_output_fused: bool = False
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
@@ -339,7 +350,7 @@ class TaskSplitValue:
     def all_event_num(self) -> int:
         """Total number of events needed for the schedule."""
         e = self.single_rank_expert_num
-        return 1 + self.all_expert_num + e + e + e
+        return 1 + self.all_expert_num + e + e + e + self.extra_event_num
 
     # ── Runtime counters (reset by init_task_split_value per rank) ────────────
     rank_id:              int = 0
@@ -483,11 +494,11 @@ def validate_runtime_config(
         ):
             continue
         _validate_task_bounds(task, descriptor_index)
-
+        task_groups = 1 if task.inputs[0].tensor_type == 2 else group_size
         if task_type in (TaskType.TASK_SWI_GLU, TaskType.TASK_SWI_GLU_GRAD):
-            _validate_swiglu_task(task, descriptor_index, group_size)
+            _validate_swiglu_task(task, descriptor_index, task_groups)
         elif task_type == TaskType.TASK_GROUPED_MATMUL:
-            _validate_gmm_task(task, descriptor_index, num_cube_cores * local_experts)
+            _validate_gmm_task(task, descriptor_index, num_cube_cores * task_groups)
         else:
             _validate_shmem_task(task, descriptor_index, tsv)
 
@@ -510,7 +521,7 @@ def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
     cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
-def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
+def event_workspace_bytes(ep_size: int, num_experts: int, *, shared_expert: bool = False) -> int:
     """Return graph counters plus separate ready and completion generations.
 
     Args:
@@ -520,7 +531,9 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
     Returns:
         Required byte count for one direction's event workspace.
     """
-    counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
+    counter_bytes = mega_moe_event_capacity(
+        num_experts, ep_size, shared_expert=shared_expert,
+    ) * ctypes.sizeof(ctypes.c_int32)
     if ep_size <= 1:
         return counter_bytes
     return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

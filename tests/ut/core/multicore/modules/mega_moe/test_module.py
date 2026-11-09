@@ -35,13 +35,27 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables impor
 )
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
-from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec
+from hyper_parallel.core.multicore.modules.mega_moe.spec import MegaMoeSpec, _resolve_fusion_modes
 from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fusion_defaults_are_measured_legacy(self) -> None:
+        """Unselected route endpoints stay on the measured legacy path."""
+        specification = {
+            "max_local_num_tokens": None,
+            "auto_tokens": False,
+            "top_k": 8,
+            "local_num_tokens": 4096,
+            "dispatch_mode": "push",
+        }
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_resolve_fusion_modes(specification), ("legacy", "legacy"))
 
     # pylint: disable=protected-access
 
@@ -60,7 +74,7 @@ class TestMegaMoeExperts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_automatic_constructor_accepts_shapes_without_token_arguments(self) -> None:
         """Feature: Automatic token API.
-        Description: Construct both transports without predicting token counts and reject removed keywords.
+        Description: Construct both transports with automatic capacity and retain explicit static fusion shapes.
         Expectation: Start lazily at 128 rows and accept empty, aligned and arbitrary real input shapes.
         """
         for mode in ("push", "pull"):
@@ -68,8 +82,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
                                        dispatch_mode=mode)
                 self.addCleanup(layer.close)
-                self.assertFalse(hasattr(layer, "local_num_tokens"))
-                self.assertFalse(hasattr(layer, "max_local_num_tokens"))
+                self.assertIsNone(layer.local_num_tokens)
+                self.assertIsNone(layer.max_local_num_tokens)
                 self.assertTrue(layer._resource_group.specification["auto_tokens"])
                 self.assertEqual(layer._resource_group.specification["local_num_tokens"], 128)
                 self.assertIsNone(layer._resource_group.resources)
@@ -81,8 +95,12 @@ class TestMegaMoeExperts(unittest.TestCase):
                             torch.zeros(rows, 2, dtype=torch.int32), torch.ones(rows, 2), None, parameters)
                         self.assertEqual(tuple(result.shape), (rows, 16))
         for keyword in ("local_num_tokens", "max_local_num_tokens"):
-            with self.subTest(keyword=keyword), self.assertRaisesRegex(TypeError, keyword):
-                MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2, **{keyword: 128})
+            with self.subTest(keyword=keyword):
+                layer = MegaMoeExperts(hidden_size=16, intermediate_size=8, num_experts=4, top_k=2,
+                                       **{keyword: 128})
+                self.addCleanup(layer.close)
+                self.assertFalse(layer._resource_group.specification["auto_tokens"])
+                self.assertEqual(getattr(layer, keyword), 128)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -241,8 +259,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 self.assertIs(kwargs["group"], resources.spec.ep_group)
                 if kind == "layout":
                     peer_specification = list(value[2][0])
-                    self.assertEqual(peer_specification[-3], "EOI")
-                    peer_specification[-3] = "EIO"
+                    layout_index = peer_specification.index("EOI")
+                    peer_specification[layout_index] = "EIO"
                     peer = (value[0], value[1], (tuple(peer_specification),))
                 else:
                     peer = ("dynamic_tokens_v1", *value[1:]) if kind == "wire" else ("different",)
@@ -372,6 +390,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_rejects_invalid_static_values_before_allocation(
         self,
         mock_create_parameters: Mock,
@@ -415,6 +435,8 @@ class TestMegaMoeExperts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_constructor_validates_and_records_swiglu_limit(
         self,
         mock_create_parameters: Mock,
@@ -469,6 +491,67 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_shared_expert_parameters_and_autograd(self) -> None:
+        """Feature: token-local shared SwiGLU parameters.
+
+        Description: Construct an owned shared branch and evaluate it with dense CPU tensors.
+        Expectation: The packed weights use the public shapes and receive gradients independently.
+        """
+        experts = MegaMoeExperts(
+            hidden_size=16,
+            intermediate_size=8,
+            num_experts=4,
+            top_k=2,
+            shared_intermediate_size=4,
+            ep_size=1,
+        ).to(dtype=torch.bfloat16)
+        self.addCleanup(experts.close)
+        self.assertEqual(experts.shared_intermediate_size, 4)
+        self.assertEqual(tuple(experts.shared_gate_up_weight.shape), (8, 16))
+        self.assertEqual(tuple(experts.shared_down_weight.shape), (16, 4))
+        self.assertEqual(experts._resource_group.specification["shared_intermediate_size"], 4)
+
+        hidden = torch.randn(6, 16, dtype=torch.bfloat16, requires_grad=True)
+        output = experts._execute_shared_expert(
+            hidden, experts.shared_gate_up_weight, experts.shared_down_weight,
+        )
+        output.float().square().mean().backward()
+        self.assertIsNotNone(hidden.grad)
+        self.assertIsNotNone(experts.shared_gate_up_weight.grad)
+        self.assertIsNotNone(experts.shared_down_weight.grad)
+
+        for invalid in (-1, True, 1.5):
+            with self.subTest(shared_intermediate_size=invalid), self.assertRaisesRegex(
+                ValueError, "shared_intermediate_size"
+            ):
+                MegaMoeExperts(
+                    hidden_size=16,
+                    intermediate_size=8,
+                    num_experts=4,
+                    top_k=2,
+                    shared_intermediate_size=invalid,
+                    ep_size=1,
+                )
+
+    def test_full_fusion_interface(self) -> None:
+        """Normalize the full preset and reject contradictory partial settings."""
+        arguments = dict(local_num_tokens=128, hidden_size=5120, intermediate_size=128,
+                         num_experts=4, top_k=2, shared_intermediate_size=256,
+                         ep_size=1, create_parameters=False, fusion_mode="full")
+        experts = MegaMoeExperts(**arguments)
+        self.addCleanup(experts.close)
+        spec = experts._resource_group.specification
+        self.assertEqual(spec["forward_fusion_mode"], "both")
+        self.assertEqual(spec["backward_fusion_mode"], "both")
+        self.assertTrue(spec["forward_shared_expert"])
+        self.assertTrue(spec["backward_shared_expert"])
+        for overrides in ({"forward_fusion_mode": "legacy"}, {"backward_shared_expert": False},
+                          {"shared_intermediate_size": 0}, {"fusion_mode": "unknown"}):
+            with self.subTest(**overrides), self.assertRaises(ValueError):
+                MegaMoeExperts(**{**arguments, **overrides})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
         """Feature: forward passes router inputs and restores shape.
         Description: Execute forward with router metadata and caller-shaped inputs.
@@ -487,9 +570,12 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=SimpleNamespace(auto_tokens=False, dynamic_tokens=False),
-                                    plan=object(), workspace=object(), ensure_capacity=Mock(),
-                                    plan_for_tokens=Mock())
+        spec = SimpleNamespace(auto_tokens=False, dynamic_tokens=False, local_num_tokens=128,
+                               forward_permute_fused=False,
+                               forward_shared_expert=False, backward_shared_expert=False,
+                               forward_fusion_mode="legacy", backward_fusion_mode="legacy")
+        resources = SimpleNamespace(spec=spec, plan=SimpleNamespace(spec=spec), workspace=object(),
+                                    ensure_capacity=Mock(), plan_for_tokens=Mock())
         route = SimpleNamespace(
             routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
             unpermute_mapping=object(), maximum_received_slots=512
@@ -591,6 +677,8 @@ class TestMegaMoeExperts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     @patch.object(MegaMoeExperts, "_register_runtime_release", return_value=None)
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shared_layers_create_once_and_close_after_last_owner(
         self,
         mock_register_runtime_release: Mock,
